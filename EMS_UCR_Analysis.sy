@@ -1,0 +1,236 @@
+# ========================================================================
+# UCR Dataset Analysis - FULLY OPTIMIZED & VECTORIZED VERSION
+# ========================================================================
+
+!pip install pymoo pandas numpy scipy scikit-learn matplotlib seaborn openpyxl -q
+
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
+import io
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+from pymoo.algorithms.moo.nsga2 import NSGA2
+from pymoo.core.problem import ElementwiseProblem
+from pymoo.operators.crossover.sbx import SBX
+from pymoo.operators.mutation.pm import PM
+from pymoo.operators.sampling.rnd import FloatRandomSampling
+from pymoo.optimize import minimize as pymoo_minimize
+
+warnings.filterwarnings('ignore')
+print("=" * 70)
+print("UCR Dataset Analysis - OPTIMIZED & VECTORIZED VERSION")
+print("=" * 70)
+
+# ========================================================================
+# File Upload
+# ========================================================================
+
+print("\nPlease upload your CSV files (select multiple files at once)")
+from google.colab import files
+uploaded = files.upload()
+
+if not uploaded:
+    raise ValueError("لم يتم تحميل أي ملف! يرجى رفع ملفات CSV.")
+
+df_list = []
+print(f"\nUploaded {len(uploaded)} files. Processing...")
+
+# ========================================================================
+# Process and Merge Files
+# ========================================================================
+
+for idx, (filename, content) in enumerate(uploaded.items()):
+    try:
+        df = pd.read_csv(io.BytesIO(content))
+        df['file_id'] = idx
+
+        # ==== الوقت (Time) ====
+        if 'Time' in df.columns:
+            time_vals = df['Time'].values
+            if len(time_vals) > 1:
+                dt_avg = np.mean(np.diff(time_vals))
+                if dt_avg <= 0 or dt_avg > 10:
+                    df['Time'] = np.arange(len(df)) * 0.1
+        else:
+            df['Time'] = np.arange(len(df)) * 0.1
+
+        # ==== السرعة (Speed - m/s) ====
+        if 'Speed Meter (km/h) [Consult III]' in df.columns:
+            df['Speed'] = df['Speed Meter (km/h) [Consult III]'] / 3.6
+        elif 'SPEED (mph)[GPS]' in df.columns:
+            df['Speed'] = df['SPEED (mph)[GPS]'] * 0.44704
+        elif 'Speed' in df.columns:
+            df['Speed'] = df['Speed'] / 3.6 if df['Speed'].max() > 40 else df['Speed']
+        else:
+            df['Speed'] = 0.0
+
+        # ==== درجة الحرارة ====
+        df['T_amb'] = df['Ambient Temperature (degree C)'] if 'Ambient Temperature (degree C)' in df.columns else 25.0
+
+        # ==== الانحدار (Slope) ====
+        if 'ALTITUDE' in df.columns and len(df) > 1:
+            alt = df['ALTITUDE'].values
+            speed = df['Speed'].values
+            time_vals = df['Time'].values
+            dt_vals = np.diff(time_vals, prepend=time_vals[0] + 0.1)
+            dt_vals[dt_vals <= 0] = 0.1
+            dist = speed * dt_vals
+            
+            dz = np.diff(alt, prepend=alt[0])
+            slope = np.zeros(len(df))
+            valid = dist > 0.01
+            slope[valid] = np.degrees(np.arctan(dz[valid] / dist[valid]))
+            df['Slope'] = np.clip(slope, -15, 15)
+        else:
+            df['Slope'] = 0.0
+
+        # ==== SOC & AC Power ====
+        df['SOC'] = df['HV Battery Level (%)'] / 100.0 if 'HV Battery Level (%)' in df.columns else 0.8
+        df['P_ac'] = df['Power Consumption (A/C) (kW)'] * 0.3 if 'Power Consumption (A/C) (kW)' in df.columns else 0.0
+
+        # ==== تصفية القيم ====
+        df = df[(df['Speed'] >= 0) & (df['Speed'] < 40)]
+        df = df[df['P_ac'] < 5.0]
+        df = df.dropna(subset=['Speed', 'Slope', 'T_amb'])
+
+        if len(df) > 10:
+            df_list.append(df[['Time', 'Speed', 'Slope', 'T_amb', 'SOC', 'P_ac', 'file_id']])
+    except Exception as e:
+        print(f"تخطّي الملف {filename} بسبب خطأ: {e}")
+
+df_all = pd.concat(df_list, ignore_index=True)
+print(f"\nMerged data: {len(df_all):,} rows")
+
+# ========================================================================
+# K-Means Analysis
+# ========================================================================
+
+print("\nRunning K-Means Analysis...")
+sample_size = min(50000, len(df_all))
+df_sample = df_all.sample(n=sample_size, random_state=42)
+
+X = df_sample[['Speed', 'Slope', 'T_amb']].values
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+silhouettes = []
+K_range = range(2, 11)
+
+for k in K_range:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=5)
+    labels = kmeans.fit_predict(X_scaled)
+    sil = silhouette_score(X_scaled, labels)
+    silhouettes.append(sil)
+    print(f"  K={k}: Silhouette Score = {sil:.4f}")
+
+best_k = K_range[np.argmax(silhouettes)]
+print(f"\nOptimal K: {best_k} (Silhouette: {max(silhouettes):.4f})")
+
+# ========================================================================
+# Vectorized NSGA-II Optimization
+# ========================================================================
+
+class VectorizedEVProblem(ElementwiseProblem):
+    def __init__(self, df, dt):
+        self.df = df.reset_index(drop=True)
+        self.dt = dt
+        self.n_steps = len(self.df)
+        
+        # 3 variables per step: [I_bat, T_m, m_dot]
+        n_var = self.n_steps * 3
+        
+        xl, xu = [], []
+        for _ in range(self.n_steps):
+            xl.extend([-50.0, 0.0, 0.001])
+            xu.extend([100.0, 200.0, 0.05])
+            
+        super().__init__(n_var=n_var, n_obj=3, xl=np.array(xl), xu=np.array(xu))
+        
+        # Constants
+        self.V_bat = 400.0
+        self.R0 = 0.0005
+        self.R1 = 0.0002
+        self.Q_nom = 200.0
+        
+        # Pre-extract vectors
+        self.speed = self.df['Speed'].values
+        self.t_amb = self.df['T_amb'].values
+        self.p_ac = self.df['P_ac'].values
+
+    def _evaluate(self, x, out, *args, **kwargs):
+        # Reshape variables matrix: (n_steps, 3)
+        vars_mat = x.reshape((self.n_steps, 3))
+        I_bat = vars_mat[:, 0]
+        T_m = vars_mat[:, 1]
+        m_dot = vars_mat[:, 2]
+        
+        # 1. Energy Consumption (kWh)
+        P_bat_W = self.V_bat * I_bat
+        energy_kWh = np.sum(np.maximum(0, P_bat_W) * self.dt) / 3600000.0
+        
+        # 2. Cooling Power & Thermal Model (Vectorized)
+        Q_gen_W = (I_bat**2) * (self.R0 + self.R1)
+        P_cool_W = np.maximum(0, m_dot * 4200.0 * 5.0 + self.p_ac * 500.0)
+        cooling_kWh = np.sum(P_cool_W * self.dt) / 3600000.0
+        
+        # Temperature Estimation
+        T_bat_est = self.t_amb + (Q_gen_W - P_cool_W) / 20000.0
+        T_bat_est = np.clip(T_bat_est, 20.0, 60.0)
+        
+        # 3. Degradation (Arrhenius Equation)
+        temp_K = T_bat_est + 273.15
+        degradation = np.sum(1e-5 * np.exp(-40000.0 / (8.314 * temp_K)) * np.abs(I_bat) * self.dt)
+        
+        # 4. Total Distance
+        total_dist_km = np.sum(self.speed * self.dt) / 1000.0
+        dist_factor = total_dist_km if total_dist_km > 0.01 else 1.0
+        
+        # Objectives
+        J1 = energy_kWh / dist_factor
+        J2 = float(np.clip(degradation, 0.0, 1.0))
+        J3 = cooling_kWh / dist_factor
+        
+        out["F"] = [J1, J2, J3]
+
+# Prepare Data
+sample_size = min(300, len(df_all))
+df_opt = df_all.iloc[:sample_size].copy()
+
+dt_actual = np.mean(np.diff(df_opt['Time'].values)) if len(df_opt) > 1 else 0.1
+if dt_actual <= 0: dt_actual = 0.1
+
+problem = VectorizedEVProblem(df_opt, dt_actual)
+
+algorithm = NSGA2(
+    pop_size=40,
+    sampling=FloatRandomSampling(),
+    crossover=SBX(prob=0.9, eta=20),
+    mutation=PM(prob=0.1, eta=20),
+    eliminate_duplicates=True
+)
+
+print("\nStarting optimization...")
+start_time = time.time()
+res = pymoo_minimize(problem, algorithm, ('n_gen', 50), seed=42, verbose=False)
+exec_time = time.time() - start_time
+
+print(f"\nOptimization completed in {exec_time:.2f} seconds")
+print(f"Number of Pareto solutions: {len(res.X)}")
+
+# ========================================================================
+# Results Summary
+# ========================================================================
+
+if res.F is not None and len(res.F) > 0:
+    df_res = pd.DataFrame(res.F, columns=['J1_kWh_km', 'J2_Degradation', 'J3_Cooling_kWh_km'])
+    print("\n" + "=" * 60)
+    print("RESULTS SUMMARY")
+    print("=" * 60)
+    print(df_res.describe().T[['mean', 'std', 'min', '50%', 'max']])
+    
+    df_res.to_csv('results_corrected_vectorized.csv', index=False)
+    print("\nSaved to 'results_corrected_vectorized.csv'")
