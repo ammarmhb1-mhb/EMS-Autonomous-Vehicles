@@ -1,0 +1,9 @@
+pymoo
+pandas
+numpy
+scipy
+scikit-learn
+matplotlib
+seaborn
+openpyxl
+tensorflow
