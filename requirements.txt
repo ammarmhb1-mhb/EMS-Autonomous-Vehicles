@@ -1,9 +1,8 @@
-pymoo
-pandas
-numpy
-scipy
-scikit-learn
-matplotlib
-seaborn
-openpyxl
-tensorflow
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+pymoo==0.6.2
+matplotlib>=3.7
+seaborn>=0.12
+scipy>=1.11
+joblib>=1.3
